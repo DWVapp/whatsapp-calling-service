@@ -1,0 +1,14 @@
+services:
+  whatsapp-calling:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4002:19000"
+    env_file:
+      - .env
+    volumes:
+      - ./server.js:/app/server.js
+      - ./public:/app/public
+    restart: unless-stopped
