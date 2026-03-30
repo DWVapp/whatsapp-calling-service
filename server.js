@@ -1,321 +1,340 @@
 require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
-const path = require("path");
 const http = require("http");
-const socketIO = require("socket.io");
+const WebSocket = require("ws");
+const jwt = require("jsonwebtoken");
 const {
-    RTCPeerConnection,
-    RTCSessionDescription,
-    RTCIceCandidate,
-    MediaStream,
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCIceCandidate,
+  MediaStream,
 } = require("wrtc");
+const SessionManager = require("./session-manager");
 
-// STUN server allows each peer to discover its public IP for NAT traversal
-const ICE_SERVERS = [{ urls: "stun:stun.relay.metered.ca:80" }];
+// --- Configuration ---
 
-const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/calls`;
-const ACCESS_TOKEN = `Bearer ${process.env.ACCESS_TOKEN}`;
-
-const app = express();
-const server = http.createServer(app);
-const io = socketIO(server);
-
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-
-// State variables per call session
-let browserPc = null;
-let browserStream = null;
-let whatsappPc = null;
-let whatsappStream = null;
-let browserOfferSdp = null;
-let whatsappOfferSdp = null;
-let browserSocket = null;
-let currentCallId = null;
-
-/**
- * Socket.IO connection from browser client.
- */
-io.on("connection", (socket) => {
-    console.log(`Socket.IO connection established with browser: ${socket.id}`);
-
-    // SDP offer from browser
-    socket.on("browser-offer", async (sdp) => {
-        console.log("Received SDP offer from browser.");
-        browserOfferSdp = sdp;
-        browserSocket = socket;
-        await initiateWebRTCBridge();
-    });
-
-    // ICE candidate from browser
-    socket.on("browser-candidate", async (candidate) => {
-        if (!browserPc) {
-            console.warn("Cannot add ICE candidate: browser peer connection not initialized.");
-            return;
-        }
-
-        try {
-            await browserPc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-            console.error("Failed to add ICE candidate from browser:", err);
-        }
-    });
-
-    // Reject call from browser
-    socket.on("reject-call", async (callId) => {
-        const result = await rejectCall(callId);
-        console.log("Reject call response:", result);
-    });
-
-    // Terminate call from browser
-    socket.on("terminate-call", async (callId) => {
-        const result = await terminateCall(callId);
-        console.log("Terminate call response:", result);
-    });
-});
-
-/**
- * Handles incoming WhatsApp webhook call events.
- */
-app.post("/call-events", async (req, res) => {
-    try {
-        const entry = req.body?.entry?.[0];
-        const change = entry?.changes?.[0];
-        const call = change?.value?.calls?.[0];
-        const contact = change?.value?.contacts?.[0];
-
-        if (!call || !call.id || !call.event) {
-            console.warn("Received invalid or incomplete call event.");
-            return res.sendStatus(200);
-        }
-
-        const callId = call.id;
-        currentCallId = callId;
-
-        if (call.event === "connect") {
-            whatsappOfferSdp = call?.session?.sdp;
-            const callerName = contact?.profile?.name || "Unknown";
-            const callerNumber = contact?.wa_id || "Unknown";
-
-            console.log(`Incoming WhatsApp call from ${callerName} (${callerNumber})`);
-            io.emit("call-is-coming", { callId, callerName, callerNumber });
-
-            await initiateWebRTCBridge();
-
-        } else if (call.event === "terminate") {
-            console.log(`WhatsApp call terminated. Call ID: ${callId}`);
-            io.emit("call-ended");
-
-            if (call.duration && call.status) {
-                console.log(`Call duration: ${call.duration}s | Status: ${call.status}`);
-            }
-
-        } else {
-            console.log(`Unhandled WhatsApp call event: ${call.event}`);
-        }
-
-        res.sendStatus(200);
-    } catch (err) {
-        console.error("Error processing /call-events webhook:", err);
-        res.sendStatus(500);
-    }
-});
-
-/**
- * Initiates WebRTC between browser and WhatsApp once both SDP offers are received.
- */
-async function initiateWebRTCBridge() {
-    if (!browserOfferSdp || !whatsappOfferSdp || !browserSocket) return;
-
-    // --- Setup browser peer connection ---
-    browserPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    browserStream = new MediaStream();
-
-    browserPc.ontrack = (event) => {
-        console.log("Audio track received from browser.");
-        event.streams[0].getTracks().forEach((track) => browserStream.addTrack(track));
-    };
-
-    browserPc.onicecandidate = (event) => {
-        if (event.candidate) {
-            browserSocket.emit("browser-candidate", event.candidate);
-        }
-    };
-
-    await browserPc.setRemoteDescription(new RTCSessionDescription({
-        type: "offer",
-        sdp: browserOfferSdp
-    }));
-    console.log("Browser offer SDP set as remote description.");
-
-    // --- Setup WhatsApp peer connection ---
-    whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    const waTrackPromise = new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject("Timed out waiting for WhatsApp track"), 10000);
-        whatsappPc.ontrack = (event) => {
-            clearTimeout(timeout);
-            console.log("Audio track received from WhatsApp.");
-            whatsappStream = event.streams[0];
-            resolve();
-        };
-    });
-
-    await whatsappPc.setRemoteDescription(new RTCSessionDescription({
-        type: "offer",
-        sdp: whatsappOfferSdp
-    }));
-    console.log("WhatsApp offer SDP set as remote description.");
-
-    // Forward browser mic to WhatsApp
-    browserStream?.getAudioTracks().forEach((track) => {
-        whatsappPc.addTrack(track, browserStream);
-    });
-    console.log("Forwarded browser audio to WhatsApp.");
-
-    // Wait for WhatsApp to send audio
-    await waTrackPromise;
-
-    // Forward WhatsApp audio to browser
-    whatsappStream?.getAudioTracks().forEach((track) => {
-        browserPc.addTrack(track, whatsappStream);
-    });
-
-    // --- Create SDP answers for both peers ---
-    const browserAnswer = await browserPc.createAnswer();
-    await browserPc.setLocalDescription(browserAnswer);
-    browserSocket.emit("browser-answer", browserAnswer.sdp);
-    console.log("Browser answer SDP created and sent.");
-
-    const waAnswer = await whatsappPc.createAnswer();
-    await whatsappPc.setLocalDescription(waAnswer);
-    const finalWaSdp = waAnswer.sdp.replace("a=setup:actpass", "a=setup:active");
-    console.log("WhatsApp answer SDP prepared.");
-
-    // Send pre-accept, and only proceed with accept if successful
-    const preAcceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "pre_accept");
-
-    if (preAcceptSuccess) {
-        setTimeout(async () => {
-            const acceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "accept");
-            if (acceptSuccess && browserSocket) {
-                browserSocket.emit("start-browser-timer");
-            }
-        }, 1000);
-    } else {
-        console.error("Pre-accept failed. Aborting accept step.");
-    }
-
-    // Reset session state
-    browserOfferSdp = null;
-    whatsappOfferSdp = null;
-}
-
-/**
- * Sends "pre-accept" or "accept" response with SDP to WhatsApp API.
- */
-async function answerCallToWhatsApp(callId, sdp, action) {
-    const body = {
-        messaging_product: "whatsapp",
-        call_id: callId,
-        action,
-        session: { sdp_type: "answer", sdp },
-    };
-
-    try {
-        const response = await axios.post(WHATSAPP_API_URL, body, {
-            headers: {
-                Authorization: ACCESS_TOKEN,
-                "Content-Type": "application/json",
-            },
-        });
-
-        const success = response.data?.success === true;
-
-        if (success) {
-            console.log(`Successfully sent '${action}' to WhatsApp.`);
-            return true;
-        } else {
-            console.warn(`WhatsApp '${action}' response was not successful.`);
-            return false;
-        }
-    } catch (error) {
-        console.error(`Failed to send '${action}' to WhatsApp:`, error.message);
-        return false;
-    }
-}
-
-/**
- * Rejects the current WhatsApp call.
- * Returns WhatsApp API response.
- */
-async function rejectCall(callId) {
-    const body = {
-        messaging_product: "whatsapp",
-        call_id: callId,
-        action: "reject",
-    };
-
-    try {
-        const response = await axios.post(WHATSAPP_API_URL, body, {
-            headers: {
-                Authorization: ACCESS_TOKEN,
-                "Content-Type": "application/json",
-            },
-        });
-
-        const success = response.data?.success === true;
-
-        if (success) {
-            console.log(`Call ${callId} successfully rejected.`);
-        } else {
-            console.warn(`Call ${callId} reject response was not successful.`);
-        }
-
-        return response.data;
-    } catch (error) {
-        console.error(`Failed to reject call ${callId}:`, error.message);
-        return { success: false, error: error.message };
-    }
-}
-
-/**
- * Terminate WhatsApp call.
- * Returns WhatsApp API response.
- */
- async function terminateCall(callId) {
-    const body = {
-        messaging_product: "whatsapp",
-        call_id: callId,
-        action: "terminate",
-    };
-
-    try {
-        const response = await axios.post(WHATSAPP_API_URL, body, {
-            headers: {
-                Authorization: ACCESS_TOKEN,
-                "Content-Type": "application/json",
-            },
-        });
-
-        const success = response.data?.success === true;
-
-        if (success) {
-            console.log(`Call ${callId} successfully terminated.`);
-        } else {
-            console.warn(`Call ${callId} terminate response was not successful.`);
-        }
-
-        return response.data;
-    } catch (error) {
-        console.error(`Failed to terminate call ${callId}:`, error.message);
-        return { success: false, error: error.message };
-    }
-}
-
-// Start the server
 const PORT = process.env.PORT || 19000;
+const CHAT_APP_WS_URL = process.env.CHAT_APP_WS_URL || "ws://localhost:4001/ws/calling";
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+const SERVICE_NAME = "whatsapp-calling-service";
+
+const STUN_URL = process.env.STUN_URL || "stun:stun.relay.metered.ca:80";
+const TURN_URL = process.env.TURN_URL || "";
+const TURN_USERNAME = process.env.TURN_USERNAME || "";
+const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
+
+function getIceServers() {
+  const servers = [{ urls: STUN_URL }];
+  if (TURN_URL) {
+    servers.push({
+      urls: TURN_URL,
+      username: TURN_USERNAME,
+      credential: TURN_CREDENTIAL,
+    });
+  }
+  return servers;
+}
+
+// --- State ---
+
+const sessions = new SessionManager();
+let chatAppWs = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY = 30000;
+
+// --- HTTP server (health check) ---
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      activeSessions: sessions.size,
+      chatAppConnected: chatAppWs?.readyState === WebSocket.OPEN,
+    }));
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("WhatsApp Calling Service running");
+});
+
+// --- WebSocket connection to chat-app ---
+
+function connectToChatApp() {
+  const token = jwt.sign({ service: SERVICE_NAME }, JWT_SECRET, { expiresIn: "24h" });
+
+  console.log(`[WS] Connecting to chat-app at ${CHAT_APP_WS_URL}...`);
+  chatAppWs = new WebSocket(CHAT_APP_WS_URL, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  chatAppWs.on("open", () => {
+    console.log("[WS] Connected to chat-app");
+    reconnectAttempts = 0;
+  });
+
+  chatAppWs.on("message", (raw) => {
+    try {
+      const message = JSON.parse(raw);
+      handleChatAppMessage(message);
+    } catch (err) {
+      console.error("[WS] Failed to parse message:", err.message);
+    }
+  });
+
+  chatAppWs.on("close", () => {
+    console.log("[WS] Disconnected from chat-app");
+    scheduleReconnect();
+  });
+
+  chatAppWs.on("error", (err) => {
+    console.error("[WS] Connection error:", err.message);
+  });
+}
+
+function scheduleReconnect() {
+  reconnectAttempts++;
+  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+  console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...`);
+  setTimeout(connectToChatApp, delay);
+}
+
+function sendToChatApp(event, payload) {
+  if (!chatAppWs || chatAppWs.readyState !== WebSocket.OPEN) {
+    console.warn("[WS] Cannot send — not connected to chat-app");
+    return false;
+  }
+  chatAppWs.send(JSON.stringify({ event, ...payload }));
+  return true;
+}
+
+// --- Handle commands from chat-app ---
+
+function handleChatAppMessage(message) {
+  const { event, callId } = message;
+
+  switch (event) {
+    case "start_call":
+      handleStartCall(message);
+      break;
+    case "whatsapp_offer":
+      handleWhatsappOffer(message);
+      break;
+    case "browser_offer":
+      handleBrowserOffer(message);
+      break;
+    case "browser_candidate":
+      handleBrowserCandidate(message);
+      break;
+    case "accept_call":
+      handleAcceptCall(message);
+      break;
+    case "end_call":
+      handleEndCall(callId);
+      break;
+    default:
+      console.warn(`[WS] Unknown event: ${event}`);
+  }
+}
+
+// --- Call handlers ---
+
+function handleStartCall({ callId, callType, userId, callerName, callerNumber }) {
+  const session = sessions.create(callId, {
+    callType: callType || "audio",
+    userId,
+    callerName,
+    callerNumber,
+  });
+  console.log(`[Call] Session started: ${callId} (${session.callType})`);
+}
+
+function handleWhatsappOffer({ callId, sdp }) {
+  const session = sessions.get(callId);
+  if (!session) {
+    console.warn(`[Call] No session for WhatsApp offer: ${callId}`);
+    return;
+  }
+
+  session.whatsappOfferSdp = sdp;
+  console.log(`[Call] WhatsApp SDP offer received for: ${callId}`);
+  tryInitiateBridge(callId);
+}
+
+function handleBrowserOffer({ callId, sdp }) {
+  const session = sessions.get(callId);
+  if (!session) {
+    console.warn(`[Call] No session for browser offer: ${callId}`);
+    return;
+  }
+
+  session.browserOfferSdp = sdp;
+  console.log(`[Call] Browser SDP offer received for: ${callId}`);
+  tryInitiateBridge(callId);
+}
+
+function handleBrowserCandidate({ callId, candidate }) {
+  const session = sessions.get(callId);
+  if (!session?.browserPc) {
+    console.warn(`[Call] Cannot add ICE candidate — no browser PC for: ${callId}`);
+    return;
+  }
+
+  try {
+    session.browserPc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (err) {
+    console.error(`[Call] Failed to add ICE candidate for ${callId}:`, err.message);
+  }
+}
+
+function handleAcceptCall({ callId }) {
+  const session = sessions.get(callId);
+  if (!session) return;
+
+  sessions.update(callId, { status: "accepted" });
+  console.log(`[Call] Call accepted: ${callId}`);
+}
+
+function handleEndCall(callId) {
+  const session = sessions.get(callId);
+  if (!session) return;
+
+  console.log(`[Call] Ending call: ${callId}`);
+  sendToChatApp("call_ended", { callId, duration: getDuration(session) });
+  sessions.cleanup(callId);
+}
+
+function getDuration(session) {
+  if (!session.answeredAt) return 0;
+  return Math.floor((Date.now() - session.answeredAt) / 1000);
+}
+
+// --- WebRTC Bridge ---
+
+async function tryInitiateBridge(callId) {
+  const session = sessions.get(callId);
+  if (!session || !session.browserOfferSdp || !session.whatsappOfferSdp) return;
+
+  try {
+    await initiateBridge(session);
+  } catch (err) {
+    console.error(`[Bridge] Failed for ${callId}:`, err.message);
+    sendToChatApp("call_error", { callId, error: err.message });
+    sessions.cleanup(callId);
+  }
+}
+
+async function initiateBridge(session) {
+  const { callId, callType } = session;
+  const iceServers = getIceServers();
+  const includeVideo = callType === "video";
+
+  // --- Browser peer connection ---
+  session.browserPc = new RTCPeerConnection({ iceServers });
+  session.browserStream = new MediaStream();
+
+  session.browserPc.ontrack = (event) => {
+    const kind = event.track.kind;
+    console.log(`[Bridge] ${kind} track received from browser for: ${callId}`);
+    event.streams[0].getTracks().forEach((track) => session.browserStream.addTrack(track));
+  };
+
+  session.browserPc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendToChatApp("browser_candidate", { callId, candidate: event.candidate });
+    }
+  };
+
+  await session.browserPc.setRemoteDescription(
+    new RTCSessionDescription({ type: "offer", sdp: session.browserOfferSdp })
+  );
+  console.log(`[Bridge] Browser offer set for: ${callId}`);
+
+  // --- WhatsApp peer connection ---
+  session.whatsappPc = new RTCPeerConnection({ iceServers });
+
+  const waTrackPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for WhatsApp track")), 15000);
+    let tracksReceived = 0;
+    const expectedTracks = includeVideo ? 2 : 1;
+
+    session.whatsappPc.ontrack = (event) => {
+      const kind = event.track.kind;
+      console.log(`[Bridge] ${kind} track received from WhatsApp for: ${callId}`);
+
+      if (!session.whatsappStream) {
+        session.whatsappStream = event.streams[0];
+      } else {
+        event.streams[0].getTracks().forEach((track) => session.whatsappStream.addTrack(track));
+      }
+
+      tracksReceived++;
+      if (tracksReceived >= expectedTracks) {
+        clearTimeout(timeout);
+        resolve();
+      }
+    };
+  });
+
+  await session.whatsappPc.setRemoteDescription(
+    new RTCSessionDescription({ type: "offer", sdp: session.whatsappOfferSdp })
+  );
+  console.log(`[Bridge] WhatsApp offer set for: ${callId}`);
+
+  // Forward browser audio to WhatsApp
+  session.browserStream.getAudioTracks().forEach((track) => {
+    session.whatsappPc.addTrack(track, session.browserStream);
+  });
+
+  // Forward browser video to WhatsApp (if video call)
+  if (includeVideo) {
+    session.browserStream.getVideoTracks().forEach((track) => {
+      session.whatsappPc.addTrack(track, session.browserStream);
+    });
+  }
+
+  console.log(`[Bridge] Forwarded browser tracks to WhatsApp for: ${callId}`);
+
+  // Wait for WhatsApp tracks
+  await waTrackPromise;
+
+  // Forward WhatsApp audio to browser
+  session.whatsappStream.getAudioTracks().forEach((track) => {
+    session.browserPc.addTrack(track, session.whatsappStream);
+  });
+
+  // Forward WhatsApp video to browser (if video call)
+  if (includeVideo) {
+    session.whatsappStream.getVideoTracks().forEach((track) => {
+      session.browserPc.addTrack(track, session.whatsappStream);
+    });
+  }
+
+  // --- Create SDP answers ---
+  const browserAnswer = await session.browserPc.createAnswer();
+  await session.browserPc.setLocalDescription(browserAnswer);
+  sendToChatApp("browser_answer", { callId, sdp: browserAnswer.sdp });
+  console.log(`[Bridge] Browser answer sent for: ${callId}`);
+
+  const waAnswer = await session.whatsappPc.createAnswer();
+  await session.whatsappPc.setLocalDescription(waAnswer);
+  const finalWaSdp = waAnswer.sdp.replace("a=setup:actpass", "a=setup:active");
+
+  sendToChatApp("whatsapp_answer", { callId, sdp: finalWaSdp });
+  console.log(`[Bridge] WhatsApp answer sent for: ${callId}`);
+
+  sessions.update(callId, {
+    status: "connected",
+    answeredAt: Date.now(),
+    browserOfferSdp: null,
+    whatsappOfferSdp: null,
+  });
+
+  sendToChatApp("call_connected", { callId });
+}
+
+// --- Start ---
+
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server is running at http://0.0.0.0:${PORT}`);
+  console.log(`[Server] Running at http://0.0.0.0:${PORT}`);
+  connectToChatApp();
 });
