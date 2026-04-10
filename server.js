@@ -13,9 +13,7 @@ const SessionManager = require("./session-manager");
 // --- Configuration ---
 
 const PORT = process.env.PORT || 19000;
-const CHAT_APP_WS_URL = process.env.CHAT_APP_WS_URL || "ws://localhost:4001/ws/calling";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
-const SERVICE_NAME = "whatsapp-calling-service";
 
 const STUN_URL = process.env.STUN_URL || "stun:stun.relay.metered.ca:80";
 const TURN_URL = process.env.TURN_URL || "";
@@ -38,8 +36,6 @@ function getIceServers() {
 
 const sessions = new SessionManager();
 let chatAppWs = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_DELAY = 30000;
 
 // --- HTTP server (health check) ---
 
@@ -57,22 +53,26 @@ const server = http.createServer((req, res) => {
   res.end("WhatsApp Calling Service running");
 });
 
-// --- WebSocket connection to chat-app ---
+// --- WebSocket server for chat-app connections ---
 
-function connectToChatApp() {
-  const token = jwt.sign({ service: SERVICE_NAME }, JWT_SECRET, { expiresIn: "24h" });
+const wss = new WebSocket.Server({ server });
 
-  console.log(`[WS] Connecting to chat-app at ${CHAT_APP_WS_URL}...`);
-  chatAppWs = new WebSocket(CHAT_APP_WS_URL, {
-    headers: { authorization: `Bearer ${token}` },
-  });
+wss.on("connection", (ws, req) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.replace("Bearer ", "");
 
-  chatAppWs.on("open", () => {
-    console.log("[WS] Connected to chat-app");
-    reconnectAttempts = 0;
-  });
+  try {
+    jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    console.warn("[WS] Unauthorized connection attempt");
+    ws.close(4001, "Unauthorized");
+    return;
+  }
 
-  chatAppWs.on("message", (raw) => {
+  console.log("[WS] Chat-app connected");
+  chatAppWs = ws;
+
+  ws.on("message", (raw) => {
     try {
       const message = JSON.parse(raw);
       handleChatAppMessage(message);
@@ -81,26 +81,19 @@ function connectToChatApp() {
     }
   });
 
-  chatAppWs.on("close", () => {
-    console.log("[WS] Disconnected from chat-app");
-    scheduleReconnect();
+  ws.on("close", () => {
+    console.log("[WS] Chat-app disconnected");
+    if (chatAppWs === ws) chatAppWs = null;
   });
 
-  chatAppWs.on("error", (err) => {
+  ws.on("error", (err) => {
     console.error("[WS] Connection error:", err.message);
   });
-}
-
-function scheduleReconnect() {
-  reconnectAttempts++;
-  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
-  console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...`);
-  setTimeout(connectToChatApp, delay);
-}
+});
 
 function sendToChatApp(event, payload) {
   if (!chatAppWs || chatAppWs.readyState !== WebSocket.OPEN) {
-    console.warn("[WS] Cannot send — not connected to chat-app");
+    console.warn("[WS] Cannot send — chat-app not connected");
     return false;
   }
   chatAppWs.send(JSON.stringify({ event, ...payload }));
@@ -224,17 +217,15 @@ async function tryInitiateBridge(callId) {
 }
 
 async function initiateBridge(session) {
-  const { callId, callType } = session;
+  const { callId } = session;
   const iceServers = getIceServers();
-  const includeVideo = callType === "video";
 
-  // --- Browser peer connection ---
+  // --- Browser peer connection (audio only) ---
   session.browserPc = new RTCPeerConnection({ iceServers });
   session.browserStream = new MediaStream();
 
   session.browserPc.ontrack = (event) => {
-    const kind = event.track.kind;
-    console.log(`[Bridge] ${kind} track received from browser for: ${callId}`);
+    console.log(`[Bridge] Audio track received from browser for: ${callId}`);
     event.streams[0].getTracks().forEach((track) => session.browserStream.addTrack(track));
   };
 
@@ -249,29 +240,17 @@ async function initiateBridge(session) {
   );
   console.log(`[Bridge] Browser offer set for: ${callId}`);
 
-  // --- WhatsApp peer connection ---
+  // --- WhatsApp peer connection (audio only) ---
   session.whatsappPc = new RTCPeerConnection({ iceServers });
 
   const waTrackPromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timed out waiting for WhatsApp track")), 15000);
-    let tracksReceived = 0;
-    const expectedTracks = includeVideo ? 2 : 1;
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for WhatsApp audio track")), 15000);
 
     session.whatsappPc.ontrack = (event) => {
-      const kind = event.track.kind;
-      console.log(`[Bridge] ${kind} track received from WhatsApp for: ${callId}`);
-
-      if (!session.whatsappStream) {
-        session.whatsappStream = event.streams[0];
-      } else {
-        event.streams[0].getTracks().forEach((track) => session.whatsappStream.addTrack(track));
-      }
-
-      tracksReceived++;
-      if (tracksReceived >= expectedTracks) {
-        clearTimeout(timeout);
-        resolve();
-      }
+      clearTimeout(timeout);
+      console.log(`[Bridge] Audio track received from WhatsApp for: ${callId}`);
+      session.whatsappStream = event.streams[0];
+      resolve();
     };
   });
 
@@ -284,30 +263,15 @@ async function initiateBridge(session) {
   session.browserStream.getAudioTracks().forEach((track) => {
     session.whatsappPc.addTrack(track, session.browserStream);
   });
+  console.log(`[Bridge] Forwarded browser audio to WhatsApp for: ${callId}`);
 
-  // Forward browser video to WhatsApp (if video call)
-  if (includeVideo) {
-    session.browserStream.getVideoTracks().forEach((track) => {
-      session.whatsappPc.addTrack(track, session.browserStream);
-    });
-  }
-
-  console.log(`[Bridge] Forwarded browser tracks to WhatsApp for: ${callId}`);
-
-  // Wait for WhatsApp tracks
+  // Wait for WhatsApp audio track
   await waTrackPromise;
 
   // Forward WhatsApp audio to browser
   session.whatsappStream.getAudioTracks().forEach((track) => {
     session.browserPc.addTrack(track, session.whatsappStream);
   });
-
-  // Forward WhatsApp video to browser (if video call)
-  if (includeVideo) {
-    session.whatsappStream.getVideoTracks().forEach((track) => {
-      session.browserPc.addTrack(track, session.whatsappStream);
-    });
-  }
 
   // --- Create SDP answers ---
   const browserAnswer = await session.browserPc.createAnswer();
@@ -335,6 +299,5 @@ async function initiateBridge(session) {
 // --- Start ---
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Server] Running at http://0.0.0.0:${PORT}`);
-  connectToChatApp();
+  console.log(`[Server] Running at http://0.0.0.0:${PORT} (WebSocket server ready)`);
 });
