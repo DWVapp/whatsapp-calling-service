@@ -326,9 +326,17 @@ async function initiateBridge(session) {
   session.browserPc = new RTCPeerConnection({ iceServers });
   session.browserStream = new MediaStream();
 
-  session.browserPc.ontrack = (event) => {
-    event.streams[0].getTracks().forEach((track) => session.browserStream.addTrack(track));
-  };
+  const browserTrackPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Timed out waiting for browser audio track")),
+      15000
+    );
+    session.browserPc.ontrack = (event) => {
+      clearTimeout(timeout);
+      event.streams[0].getTracks().forEach((track) => session.browserStream.addTrack(track));
+      resolve();
+    };
+  });
 
   session.browserPc.onicecandidate = (event) => {
     if (event.candidate) {
@@ -340,8 +348,14 @@ async function initiateBridge(session) {
     new RTCSessionDescription({ type: "offer", sdp: session.browserOfferSdp })
   );
 
+  await browserTrackPromise;
+
   // --- WhatsApp peer connection (audio only) ---
   session.whatsappPc = new RTCPeerConnection({ iceServers });
+
+  session.browserStream.getAudioTracks().forEach((track) => {
+    session.whatsappPc.addTrack(track, session.browserStream);
+  });
 
   const waTrackPromise = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Timed out waiting for WhatsApp audio track")), 15000);
@@ -357,17 +371,13 @@ async function initiateBridge(session) {
     new RTCSessionDescription({ type: "offer", sdp: session.whatsappOfferSdp })
   );
 
-  session.browserStream.getAudioTracks().forEach((track) => {
-    session.whatsappPc.addTrack(track, session.browserStream);
-  });
-
   await waTrackPromise;
 
   session.whatsappStream.getAudioTracks().forEach((track) => {
     session.browserPc.addTrack(track, session.whatsappStream);
   });
 
-  // --- Create SDP answers ---
+  // --- Create SDP answers (both peers now have all tracks added) ---
   const browserAnswer = await session.browserPc.createAnswer();
   await session.browserPc.setLocalDescription(browserAnswer);
   sendToChatApp("browser_answer", { callId, sdp: browserAnswer.sdp });
