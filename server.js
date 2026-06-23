@@ -7,7 +7,7 @@ const {
   RTCSessionDescription,
   RTCIceCandidate,
   MediaStream,
-} = require("wrtc");
+} = require("@roamhq/wrtc");
 const SessionManager = require("./session-manager");
 
 // --- Configuration ---
@@ -17,19 +17,61 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 
 const STUN_URL = process.env.STUN_URL || "stun:stun.relay.metered.ca:80";
 const TURN_URL = process.env.TURN_URL || "";
+const TURN_URLS = process.env.TURN_URLS || "";
 const TURN_USERNAME = process.env.TURN_USERNAME || "";
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
 
+const HAS_TURN = Boolean((TURN_URL || TURN_URLS) && TURN_USERNAME && TURN_CREDENTIAL);
+const ICE_TRANSPORT_POLICY = HAS_TURN ? "relay" : "all";
+
+function getTurnUrls() {
+  if (TURN_URLS) {
+    return TURN_URLS.split(",").map((u) => u.trim()).filter(Boolean);
+  }
+  if (TURN_URL) return [TURN_URL];
+  return [];
+}
+
 function getIceServers() {
   const servers = [{ urls: STUN_URL }];
-  if (TURN_URL) {
+  const turnUrls = getTurnUrls();
+  if (turnUrls.length && TURN_USERNAME && TURN_CREDENTIAL) {
     servers.push({
-      urls: TURN_URL,
+      urls: turnUrls,
       username: TURN_USERNAME,
       credential: TURN_CREDENTIAL,
     });
   }
   return servers;
+}
+
+function createPeerConnection() {
+  return new RTCPeerConnection({
+    iceServers: getIceServers(),
+    iceTransportPolicy: ICE_TRANSPORT_POLICY,
+  });
+}
+
+function waitForIceGathering(pc, timeoutMs = 5000) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) finish();
+    };
+  });
 }
 
 // --- State ---
@@ -242,10 +284,9 @@ async function tryInitiateBridge(callId) {
 
 async function initiateOutboundBridge(session) {
   const { callId } = session;
-  const iceServers = getIceServers();
 
   // --- Browser peer connection (we are answering browser's offer) ---
-  session.browserPc = new RTCPeerConnection({ iceServers });
+  session.browserPc = createPeerConnection();
   session.browserStream = new MediaStream();
 
   const browserTrackPromise = new Promise((resolve, reject) => {
@@ -274,7 +315,7 @@ async function initiateOutboundBridge(session) {
   await browserTrackPromise;
 
   // --- WhatsApp peer connection (we are offering) ---
-  session.whatsappPc = new RTCPeerConnection({ iceServers });
+  session.whatsappPc = createPeerConnection();
 
   session.browserStream.getAudioTracks().forEach((track) => {
     session.whatsappPc.addTrack(track, session.browserStream);
@@ -293,10 +334,12 @@ async function initiateOutboundBridge(session) {
     };
   });
 
-  const waOffer = await session.whatsappPc.createOffer();
-  await session.whatsappPc.setLocalDescription(waOffer);
-  const finalWaSdp = waOffer.sdp.replace("a=setup:actpass", "a=setup:actpass");
-  sendToChatApp("whatsapp_outbound_offer", { callId, sdp: finalWaSdp });
+  await session.whatsappPc.setLocalDescription(await session.whatsappPc.createOffer());
+  await waitForIceGathering(session.whatsappPc);
+  sendToChatApp("whatsapp_outbound_offer", {
+    callId,
+    sdp: session.whatsappPc.localDescription.sdp,
+  });
 
   await waTrackPromise;
 
@@ -320,10 +363,9 @@ async function initiateOutboundBridge(session) {
 
 async function initiateBridge(session) {
   const { callId } = session;
-  const iceServers = getIceServers();
 
   // --- Browser peer connection (audio only) ---
-  session.browserPc = new RTCPeerConnection({ iceServers });
+  session.browserPc = createPeerConnection();
   session.browserStream = new MediaStream();
 
   const browserTrackPromise = new Promise((resolve, reject) => {
@@ -351,7 +393,7 @@ async function initiateBridge(session) {
   await browserTrackPromise;
 
   // --- WhatsApp peer connection (audio only) ---
-  session.whatsappPc = new RTCPeerConnection({ iceServers });
+  session.whatsappPc = createPeerConnection();
 
   session.browserStream.getAudioTracks().forEach((track) => {
     session.whatsappPc.addTrack(track, session.browserStream);
@@ -382,9 +424,12 @@ async function initiateBridge(session) {
   await session.browserPc.setLocalDescription(browserAnswer);
   sendToChatApp("browser_answer", { callId, sdp: browserAnswer.sdp });
 
-  const waAnswer = await session.whatsappPc.createAnswer();
-  await session.whatsappPc.setLocalDescription(waAnswer);
-  const finalWaSdp = waAnswer.sdp.replace("a=setup:actpass", "a=setup:active");
+  await session.whatsappPc.setLocalDescription(await session.whatsappPc.createAnswer());
+  await waitForIceGathering(session.whatsappPc);
+  const finalWaSdp = session.whatsappPc.localDescription.sdp.replace(
+    "a=setup:actpass",
+    "a=setup:active"
+  );
 
   sendToChatApp("whatsapp_answer", { callId, sdp: finalWaSdp });
 
