@@ -10,9 +10,16 @@ RUN npm install -g @mapbox/node-pre-gyp
 
 WORKDIR /app
 
-COPY package*.json ./
+# Copy only package.json (not package-lock.json): a lockfile generated on
+# another platform (e.g. macOS-arm64) makes npm skip the linux @roamhq/wrtc
+# binary — the cross-platform optional-dependency bug. Resolving fresh here
+# installs @roamhq/wrtc-linux-x64 for this image.
+COPY package.json ./
 
 RUN npm install
+
+# Fail the build early (not at runtime) if the native wrtc binary is missing.
+RUN node -e "require('@roamhq/wrtc'); console.log('wrtc native binary OK')"
 
 COPY . .
 
